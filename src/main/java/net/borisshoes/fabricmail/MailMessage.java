@@ -1,6 +1,5 @@
 package net.borisshoes.fabricmail;
 
-import com.mojang.authlib.GameProfile;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.borisshoes.borislib.BorisLib;
@@ -12,10 +11,7 @@ import net.borisshoes.borislib.utils.TextUtils;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
-import net.minecraft.server.commands.FetchProfileCommand;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.players.ProfileResolver;
-import net.minecraft.util.Util;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.nbt.CompoundTag;
@@ -24,8 +20,6 @@ import net.minecraft.resources.RegistryOps;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.players.NameAndId;
-import net.minecraft.server.players.UserNameToIdResolver;
-import net.minecraft.server.players.CachedUserNameToIdResolver;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Optional;
@@ -93,27 +87,50 @@ public class MailMessage {
       return recipientId != null && recipient != null && senderId != null && sender != null;
    }
    
-   public void validate(MinecraftServer server, CommandSourceStack commandSourceStack, @Nullable ServerPlayer player){
-      if(checkValidNoResolve()) return;
-      Util.nonCriticalIoPool().execute(() -> {
-         ProfileResolver profileResolver = server.services().profileResolver();
-         Optional<GameProfile> optional = profileResolver.fetchByName(recipient);
-         server.execute(() -> optional.ifPresentOrElse(
-               (gameProfile) -> {
-                  this.recipientId = optional.get().id();
-                  DataAccess.getPlayer(this.recipientId, BorisLib.PLAYER_DATA_KEY).tryResolve(server);
-               },
-               () -> {
-                  commandSourceStack.sendFailure(Component.translatable("text.fabricmail.recipient_not_exist"));
-                  MailStorage mailbox = DataAccess.getGlobal(MailStorage.KEY);
-                  mailbox.removeMail(this.uuid);
-                  ItemStack parcel = popParcel(server.registryAccess());
-                  if(!parcel.isEmpty() && player != null){
-                     BorisLib.addTickTimerCallback(new ItemReturnTimerCallback(parcel, player, 0));
-                  }
-               }
-         ));
-      });
+   /**
+    * Resolve recipient UUID from local data only (no Mojang / profile API).
+    * Order: already valid → online player list → BorisLib player data → usercache.
+    * @return true if recipientId is set; false if unknown (failure message already sent, mail removed)
+    */
+   public boolean validate(MinecraftServer server, CommandSourceStack commandSourceStack, @Nullable ServerPlayer player){
+      if(checkValidNoResolve()){
+         return true;
+      }
+      
+      // Online on this server (local, not Mojang)
+      ServerPlayer online = server.getPlayerList().getPlayerByName(recipient);
+      if(online != null){
+         this.recipientId = online.getUUID();
+         DataAccess.getPlayer(this.recipientId, BorisLib.PLAYER_DATA_KEY).tryResolve(server);
+         return true;
+      }
+      
+      // Players who have joined this server (BorisLib)
+      for(var data : DataAccess.allPlayerDataFor(BorisLib.PLAYER_DATA_KEY).values()){
+         String name = data.getUsername();
+         if(name != null && !name.isEmpty() && name.equalsIgnoreCase(recipient)){
+            this.recipientId = data.getPlayerID();
+            DataAccess.getPlayer(this.recipientId, BorisLib.PLAYER_DATA_KEY).tryResolve(server);
+            return true;
+         }
+      }
+      
+      // usercache.json via nameToIdCache
+      Optional<NameAndId> cached = server.services().nameToIdCache().get(recipient);
+      if(cached.isPresent()){
+         this.recipientId = cached.get().id();
+         DataAccess.getPlayer(this.recipientId, BorisLib.PLAYER_DATA_KEY).tryResolve(server);
+         return true;
+      }
+      
+      commandSourceStack.sendFailure(Component.translatable("text.fabricmail.recipient_not_exist"));
+      MailStorage mailbox = DataAccess.getGlobal(MailStorage.KEY);
+      mailbox.removeMail(this.uuid);
+      ItemStack parcelStack = popParcel(server.registryAccess());
+      if(!parcelStack.isEmpty() && player != null){
+         BorisLib.addTickTimerCallback(new ItemReturnTimerCallback(parcelStack, player, 0));
+      }
+      return false;
    }
    
    public MutableComponent getTimeDiff(long curtime){

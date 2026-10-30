@@ -336,7 +336,9 @@ public class FabricMail implements ModInitializer {
             if(!stack.isEmpty() && !player.isCreative())
                player.getInventory().removeItem(stack);
             
-            newMail.validate(server, source, player);
+            if(!newMail.validate(server, source, player)){
+               return -1;
+            }
             mailbox.addMail(newMail);
             if(onlineTo != null){
                onlineTo.sendSystemMessage(Component.translatable("text.fabricmail.received_mail").withStyle(s ->
